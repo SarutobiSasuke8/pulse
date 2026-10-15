@@ -1,19 +1,30 @@
-import type { MuteMap, Pattern, TrackId, VolumeMap } from "./types";
+import { bankForBar, clampChainPosition, nextChainPosition } from "./chain";
+import { effectiveGain } from "./mix";
+import { advanceClock, type ClockState, startClock } from "./timing";
+import type { MuteMap, Pattern, PatternBank, TrackId, VolumeMap } from "./types";
 import { STEP_COUNT, TRACK_IDS } from "./types";
 
 const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.12;
 
 export type EngineSnapshot = {
-  pattern: Pattern;
+  banks: Record<PatternBank, Pattern>;
+  /** Bank selected in the UI. Plays when chaining is off. */
+  bank: PatternBank;
+  chain: PatternBank[];
+  chainEnabled: boolean;
   bpm: number;
   swing: number;
   mutes: MuteMap;
+  solos: MuteMap;
   volumes: VolumeMap;
   master: number;
 };
 
-type StepListener = (step: number) => void;
+/** Where playback is: step -1 means stopped. chainPosition is -1 when not chaining. */
+export type StepEvent = { step: number; bank: PatternBank; chainPosition: number };
+
+type StepListener = (event: StepEvent) => void;
 
 function makeNoiseBuffer(ctx: AudioContext): AudioBuffer {
   const length = ctx.sampleRate * 1.2;
@@ -45,8 +56,8 @@ export class DrumEngine {
   private compressor: DynamicsCompressorNode | null = null;
   private noise: AudioBuffer | null = null;
   private timer: number | null = null;
-  private nextNoteTime = 0;
-  private step = 0;
+  private clock: ClockState = startClock(0);
+  private chainPosition = 0;
   private playing = false;
   private snapshot: EngineSnapshot;
   private listeners = new Set<StepListener>();
@@ -57,7 +68,14 @@ export class DrumEngine {
   }
 
   update(partial: Partial<EngineSnapshot>) {
+    const wasChaining = this.chaining();
     this.snapshot = { ...this.snapshot, ...partial };
+    if (this.chaining() && !wasChaining) {
+      // Mid-bar: finish this bar on the selected bank, start the chain next bar.
+      this.chainPosition = this.playing ? -1 : 0;
+    } else if (this.chainPosition >= 0) {
+      this.chainPosition = clampChainPosition(this.chainPosition, this.snapshot.chain.length);
+    }
     if (this.master && partial.master !== undefined) {
       this.master.gain.setTargetAtTime(partial.master, this.now(), 0.02);
     }
@@ -102,7 +120,8 @@ export class DrumEngine {
     await this.unlock();
     if (!this.ctx || this.playing) return;
     this.playing = true;
-    this.nextNoteTime = this.ctx.currentTime + 0.04;
+    this.clock = startClock(this.ctx.currentTime + 0.04);
+    this.chainPosition = 0;
     this.timer = window.setInterval(() => this.scheduler(), LOOKAHEAD_MS);
     this.scheduler();
   }
@@ -115,8 +134,9 @@ export class DrumEngine {
     }
     for (const id of this.uiTimers) window.clearTimeout(id);
     this.uiTimers.clear();
-    this.step = 0;
-    this.emit(-1);
+    this.clock = startClock(0);
+    this.chainPosition = 0;
+    this.emit({ step: -1, bank: this.snapshot.bank, chainPosition: -1 });
   }
 
   toggle(): Promise<void> {
@@ -142,50 +162,62 @@ export class DrumEngine {
     return this.ctx?.currentTime ?? 0;
   }
 
-  private scheduler(): void {
-    if (!this.ctx || !this.playing) return;
-    while (this.nextNoteTime < this.ctx.currentTime + SCHEDULE_AHEAD) {
-      this.schedule(this.step, this.nextNoteTime);
-      this.advance();
-    }
+  private chaining(): boolean {
+    return this.snapshot.chainEnabled && this.snapshot.chain.length > 0;
   }
 
-  private advance(): void {
-    const sixteenth = 60 / this.snapshot.bpm / 4;
-    const amount = (this.snapshot.swing / 100) * sixteenth * 0.58;
-    this.nextNoteTime +=
-      this.step % 2 === 0 ? sixteenth + amount : sixteenth - amount;
-    this.step = (this.step + 1) % STEP_COUNT;
+  private scheduler(): void {
+    if (!this.ctx || !this.playing) return;
+    while (this.clock.time < this.ctx.currentTime + SCHEDULE_AHEAD) {
+      this.schedule(this.clock.step, this.clock.time);
+      this.clock = advanceClock(this.clock, this.snapshot.bpm, this.snapshot.swing, STEP_COUNT);
+      if (this.clock.step === 0 && this.chaining()) {
+        this.chainPosition = nextChainPosition(this.chainPosition, this.snapshot.chain.length);
+      }
+    }
   }
 
   private schedule(step: number, time: number): void {
+    const { banks, bank, chain } = this.snapshot;
+    const chaining = this.chaining();
+    const playingBank = bankForBar(chain, chaining, this.chainPosition, bank);
+    const pattern = banks[playingBank];
     for (const id of TRACK_IDS) {
-      if (this.snapshot.mutes[id]) continue;
-      if (!this.snapshot.pattern[id][step]) continue;
-      this.voice(id, time);
+      if (!pattern[id][step]) continue;
+      const gain = this.trackGain(id);
+      if (gain <= 0) continue;
+      this.voice(id, time, gain);
     }
+    const event: StepEvent = {
+      step,
+      bank: playingBank,
+      chainPosition: chaining ? this.chainPosition : -1,
+    };
     const delay = Math.max(0, (time - this.now()) * 1000);
     const timer = window.setTimeout(() => {
       this.uiTimers.delete(timer);
-      if (this.playing) this.emit(step);
+      if (this.playing) this.emit(event);
     }, delay);
     this.uiTimers.add(timer);
   }
 
-  private emit(step: number): void {
-    for (const fn of this.listeners) fn(step);
+  private emit(event: StepEvent): void {
+    for (const fn of this.listeners) fn(event);
   }
 
   private dest(): AudioNode {
     return this.compressor ?? this.ctx!.destination;
   }
 
+  /** Volume after mute and solo. */
   private trackGain(id: TrackId): number {
-    return this.snapshot.volumes[id];
+    const { volumes, mutes, solos } = this.snapshot;
+    return effectiveGain(id, volumes, mutes, solos);
   }
 
-  private voice(id: TrackId, time: number): void {
-    const v = this.trackGain(id);
+  /** Previews ignore mute and solo so a silent track can still be auditioned. */
+  private voice(id: TrackId, time: number, gain = this.snapshot.volumes[id]): void {
+    const v = gain;
     if (id === "kick") this.kick(time, v);
     else if (id === "snare") this.snare(time, v);
     else if (id === "hats") this.hats(time, v);

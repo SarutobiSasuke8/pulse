@@ -1,5 +1,8 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { clampChainPosition, MAX_CHAIN_LENGTH } from "./chain";
+import { normalisePatternSet, type PatternSet } from "./pattern-set";
+import { clampBpm, clampSwing } from "./timing";
 import type { MuteMap, Pattern, PatternBank, TrackId, VolumeMap } from "./types";
 import {
   BANKS,
@@ -9,7 +12,6 @@ import {
   defaultVolumes,
   emptyPattern,
   STEP_COUNT,
-  TRACK_IDS,
 } from "./types";
 
 function boomBap(): Pattern {
@@ -66,7 +68,13 @@ export type SequencerState = {
   swing: number;
   master: number;
   mutes: MuteMap;
+  solos: MuteMap;
   volumes: VolumeMap;
+  /** Banks played in order, one bar each, when chainEnabled is on. */
+  chain: PatternBank[];
+  chainEnabled: boolean;
+  /** Chain entry currently playing, or -1 when stopped or not chaining. */
+  chainPosition: number;
   playing: boolean;
   currentStep: number;
   setBpm: (bpm: number) => void;
@@ -78,6 +86,15 @@ export type SequencerState = {
   toggleStep: (track: TrackId, step: number) => void;
   setStep: (track: TrackId, step: number, on: boolean) => void;
   toggleMute: (track: TrackId) => void;
+  toggleSolo: (track: TrackId) => void;
+  clearSolos: () => void;
+  appendToChain: (bank: PatternBank) => void;
+  removeFromChain: (index: number) => void;
+  clearChain: () => void;
+  setChainEnabled: (enabled: boolean) => void;
+  setChainPosition: (position: number) => void;
+  exportSet: () => PatternSet;
+  applySet: (set: PatternSet) => void;
   setVolume: (track: TrackId, value: number) => void;
   clearPattern: () => void;
   randomize: () => void;
@@ -101,13 +118,22 @@ export const useSequencer = create<SequencerState>()(
       swing: 12,
       master: 0.85,
       mutes: defaultMutes(),
+      solos: defaultMutes(),
       volumes: defaultVolumes(),
+      chain: [],
+      chainEnabled: false,
+      chainPosition: -1,
       playing: false,
       currentStep: -1,
-      setBpm: (bpm) => set({ bpm: Math.min(200, Math.max(40, Math.round(bpm))) }),
-      setSwing: (swing) => set({ swing: Math.min(100, Math.max(0, Math.round(swing))) }),
+      setBpm: (bpm) => set({ bpm: clampBpm(bpm) }),
+      setSwing: (swing) => set({ swing: clampSwing(swing) }),
       setMaster: (master) => set({ master: Math.min(1, Math.max(0, master)) }),
-      setPlaying: (playing) => set({ playing, currentStep: playing ? get().currentStep : -1 }),
+      setPlaying: (playing) =>
+        set({
+          playing,
+          currentStep: playing ? get().currentStep : -1,
+          chainPosition: playing ? get().chainPosition : -1,
+        }),
       setCurrentStep: (currentStep) => set({ currentStep }),
       selectBank: (bank) => set({ bank }),
       toggleStep: (track, step) => {
@@ -127,8 +153,46 @@ export const useSequencer = create<SequencerState>()(
         const mutes = { ...get().mutes, [track]: !get().mutes[track] };
         set({ mutes });
       },
+      toggleSolo: (track) => {
+        set({ solos: { ...get().solos, [track]: !get().solos[track] } });
+      },
+      clearSolos: () => set({ solos: defaultMutes() }),
       setVolume: (track, value) => {
-        set({ volumes: { ...get().volumes, [track]: value } });
+        const v = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+        set({ volumes: { ...get().volumes, [track]: v } });
+      },
+      appendToChain: (bank) => {
+        const { chain } = get();
+        if (chain.length >= MAX_CHAIN_LENGTH) return;
+        set({ chain: [...chain, bank] });
+      },
+      removeFromChain: (index) => {
+        const chain = get().chain.filter((_, i) => i !== index);
+        set({
+          chain,
+          chainPosition:
+            get().chainPosition < 0 ? -1 : clampChainPosition(get().chainPosition, chain.length),
+        });
+      },
+      clearChain: () => set({ chain: [], chainEnabled: false, chainPosition: -1 }),
+      setChainEnabled: (chainEnabled) => set({ chainEnabled, chainPosition: -1 }),
+      setChainPosition: (chainPosition) => set({ chainPosition }),
+      exportSet: () => {
+        const s = get();
+        return normalisePatternSet({
+          bpm: s.bpm,
+          swing: s.swing,
+          banks: s.banks,
+          chain: s.chain,
+          chainEnabled: s.chainEnabled,
+          volumes: s.volumes,
+          mutes: s.mutes,
+          solos: s.solos,
+        });
+      },
+      applySet: (incoming) => {
+        const next = normalisePatternSet(incoming);
+        set({ ...next, chainPosition: -1 });
       },
       clearPattern: () => {
         const { banks, bank } = get();
@@ -158,26 +222,25 @@ export const useSequencer = create<SequencerState>()(
         swing: s.swing,
         master: s.master,
         mutes: s.mutes,
+        solos: s.solos,
         volumes: s.volumes,
+        chain: s.chain,
+        chainEnabled: s.chainEnabled,
       }),
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<SequencerState>;
-        const banks = { ...defaultBanks(), ...(p.banks ?? {}) };
-        for (const b of BANKS) {
-          const row = banks[b] ?? emptyPattern();
-          const next = emptyPattern();
-          for (const id of TRACK_IDS) {
-            const src = row[id] ?? [];
-            next[id] = Array.from({ length: STEP_COUNT }, (_, i) => Boolean(src[i]));
-          }
-          banks[b] = next;
-        }
+        const restored = normalisePatternSet(
+          { bpm: current.bpm, swing: current.swing, ...p },
+          defaultBanks(),
+        );
         return {
           ...current,
-          ...p,
-          banks,
-          mutes: { ...defaultMutes(), ...(p.mutes ?? {}) },
-          volumes: { ...defaultVolumes(), ...(p.volumes ?? {}) },
+          ...restored,
+          bank: BANKS.includes(p.bank as PatternBank) ? (p.bank as PatternBank) : current.bank,
+          master:
+            typeof p.master === "number" && Number.isFinite(p.master)
+              ? Math.min(1, Math.max(0, p.master))
+              : current.master,
         };
       },
     },
