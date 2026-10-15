@@ -1,11 +1,14 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
-import { Eraser, Play, Shuffle, Square, Volume2 } from "lucide-react";
+import { Eraser, Link2, Play, Plus, Shuffle, Square, Volume2, X } from "lucide-react";
 import { Toaster } from "sonner";
 import { AuthSlot } from "@/components/auth-slot";
+import { PatternFiles } from "@/components/pattern-files";
 import { PatternLibrary } from "@/components/pattern-library";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
+import { MAX_CHAIN_LENGTH } from "@/lib/sequencer/chain";
 import { DrumEngine } from "@/lib/sequencer/engine";
+import { anySolo, isAudible } from "@/lib/sequencer/mix";
 import { useSequencer } from "@/lib/sequencer/store";
 import {
   BANKS,
@@ -28,7 +31,11 @@ export function DrumMachine() {
   const swing = useSequencer((s) => s.swing);
   const master = useSequencer((s) => s.master);
   const mutes = useSequencer((s) => s.mutes);
+  const solos = useSequencer((s) => s.solos);
   const volumes = useSequencer((s) => s.volumes);
+  const chain = useSequencer((s) => s.chain);
+  const chainEnabled = useSequencer((s) => s.chainEnabled);
+  const chainPosition = useSequencer((s) => s.chainPosition);
   const playing = useSequencer((s) => s.playing);
   const currentStep = useSequencer((s) => s.currentStep);
   const setBpm = useSequencer((s) => s.setBpm);
@@ -39,27 +46,46 @@ export function DrumMachine() {
   const selectBank = useSequencer((s) => s.selectBank);
   const setStep = useSequencer((s) => s.setStep);
   const toggleMute = useSequencer((s) => s.toggleMute);
+  const toggleSolo = useSequencer((s) => s.toggleSolo);
+  const appendToChain = useSequencer((s) => s.appendToChain);
+  const removeFromChain = useSequencer((s) => s.removeFromChain);
+  const clearChain = useSequencer((s) => s.clearChain);
+  const setChainEnabled = useSequencer((s) => s.setChainEnabled);
   const setVolume = useSequencer((s) => s.setVolume);
   const clearPattern = useSequencer((s) => s.clearPattern);
   const randomize = useSequencer((s) => s.randomize);
 
   const pattern = banks[bank];
+  const soloing = anySolo(solos);
 
   useEffect(() => {
     void useSequencer.persist.rehydrate();
   }, []);
 
   useEffect(() => {
+    const s = useSequencer.getState();
     const engine = new DrumEngine({
-      pattern: useSequencer.getState().banks[useSequencer.getState().bank],
-      bpm: useSequencer.getState().bpm,
-      swing: useSequencer.getState().swing,
-      mutes: useSequencer.getState().mutes,
-      volumes: useSequencer.getState().volumes,
-      master: useSequencer.getState().master,
+      banks: s.banks,
+      bank: s.bank,
+      chain: s.chain,
+      chainEnabled: s.chainEnabled,
+      bpm: s.bpm,
+      swing: s.swing,
+      mutes: s.mutes,
+      solos: s.solos,
+      volumes: s.volumes,
+      master: s.master,
     });
     engineRef.current = engine;
-    const off = engine.onStep((step) => useSequencer.getState().setCurrentStep(step));
+    const off = engine.onStep(({ step, bank: playingBank, chainPosition: position }) => {
+      const state = useSequencer.getState();
+      state.setCurrentStep(step);
+      state.setChainPosition(position);
+      // While a chain plays, the grid follows the bank that is sounding.
+      if (step >= 0 && position >= 0 && state.bank !== playingBank) {
+        state.selectBank(playingBank);
+      }
+    });
     return () => {
       off();
       engine.dispose();
@@ -68,8 +94,19 @@ export function DrumMachine() {
   }, []);
 
   useEffect(() => {
-    engineRef.current?.update({ pattern, bpm, swing, mutes, volumes, master });
-  }, [pattern, bpm, swing, mutes, volumes, master]);
+    engineRef.current?.update({
+      banks,
+      bank,
+      chain,
+      chainEnabled,
+      bpm,
+      swing,
+      mutes,
+      solos,
+      volumes,
+      master,
+    });
+  }, [banks, bank, chain, chainEnabled, bpm, swing, mutes, solos, volumes, master]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -145,6 +182,7 @@ export function DrumMachine() {
           <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">PULSE</h1>
         </div>
         <div className="flex items-center gap-1.5">
+          <PatternFiles />
           <PatternLibrary />
           <AuthSlot />
         </div>
@@ -246,6 +284,66 @@ export function DrumMachine() {
               </Button>
             </div>
           </div>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Button
+              variant={chainEnabled ? "primary" : "ghost"}
+              size="sm"
+              onClick={() => setChainEnabled(!chainEnabled)}
+              disabled={chain.length === 0}
+              aria-pressed={chainEnabled}
+              title={chain.length === 0 ? "Add banks to the chain first" : "Play the chain in order"}
+            >
+              <Link2 className="size-4" />
+              Chain {chainEnabled ? "on" : "off"}
+            </Button>
+            <ol className="flex min-h-9 flex-1 flex-wrap items-center gap-1" aria-label="Pattern chain">
+              {chain.length === 0 ? (
+                <li className="text-xs text-subtle">Add banks to play them one bar each, in order.</li>
+              ) : (
+                chain.map((id, i) => (
+                  <li key={`${i}-${id}`}>
+                    <button
+                      type="button"
+                      onClick={() => removeFromChain(i)}
+                      aria-label={`Remove bank ${id} from chain position ${i + 1}`}
+                      title="Remove from chain"
+                      data-current={chainEnabled && chainPosition === i}
+                      className={cn(
+                        "group flex h-8 min-w-8 items-center justify-center gap-0.5 rounded-sm px-2 font-mono text-xs font-medium transition-colors duration-150",
+                        chainEnabled && chainPosition === i
+                          ? "bg-accent text-accent-fg"
+                          : "bg-elevated text-fg shadow-border hover:bg-pad",
+                      )}
+                    >
+                      {id}
+                      <X className="hidden size-3 group-hover:block" />
+                    </button>
+                  </li>
+                ))
+              )}
+            </ol>
+            <div className="flex items-center gap-1">
+              {BANKS.map((id) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => appendToChain(id)}
+                  disabled={chain.length >= MAX_CHAIN_LENGTH}
+                  aria-label={`Add bank ${id} to chain`}
+                  className="flex h-8 items-center gap-0.5 rounded-sm px-1.5 font-mono text-xs text-muted transition-colors duration-150 hover:bg-elevated hover:text-fg disabled:opacity-40"
+                >
+                  <Plus className="size-3" />
+                  {id}
+                </button>
+              ))}
+              {chain.length > 0 ? (
+                <Button variant="ghost" size="sm" onClick={clearChain} aria-label="Clear chain">
+                  <X className="size-4" />
+                </Button>
+              ) : null}
+            </div>
+          </div>
         </section>
 
         <section className="rounded-xl bg-surface p-3 shadow-border sm:p-4">
@@ -272,18 +370,50 @@ export function DrumMachine() {
                 <div className="flex w-14 shrink-0 flex-col items-stretch gap-1 sm:w-20">
                   <button
                     type="button"
-                    onClick={() => toggleMute(id)}
-                    onDoubleClick={() => engineRef.current?.preview(id)}
-                    title={`${TRACK_META[id].label} · tap to mute`}
+                    onClick={() => engineRef.current?.preview(id)}
+                    title={`${TRACK_META[id].label} · tap to preview`}
+                    data-audible={isAudible(id, mutes, solos)}
                     className={cn(
                       "h-9 rounded-md px-1 text-left font-mono text-xs font-medium tracking-wide transition-colors duration-150 sm:px-2",
-                      mutes[id]
-                        ? "bg-pad text-subtle line-through"
-                        : "bg-elevated text-fg shadow-border hover:bg-pad",
+                      isAudible(id, mutes, solos)
+                        ? "bg-elevated text-fg shadow-border hover:bg-pad"
+                        : "bg-pad text-subtle line-through",
                     )}
                   >
                     {TRACK_META[id].short}
                   </button>
+                  <div className="grid grid-cols-2 gap-1">
+                    <button
+                      type="button"
+                      onClick={() => toggleMute(id)}
+                      aria-pressed={mutes[id]}
+                      aria-label={`Mute ${TRACK_META[id].label}`}
+                      title="Mute"
+                      className={cn(
+                        "h-7 rounded-sm font-mono text-[11px] font-semibold transition-colors duration-150",
+                        mutes[id]
+                          ? "bg-fg text-bg"
+                          : "bg-elevated text-muted shadow-border hover:text-fg",
+                      )}
+                    >
+                      M
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleSolo(id)}
+                      aria-pressed={solos[id]}
+                      aria-label={`Solo ${TRACK_META[id].label}`}
+                      title="Solo"
+                      className={cn(
+                        "h-7 rounded-sm font-mono text-[11px] font-semibold transition-colors duration-150",
+                        solos[id]
+                          ? "bg-accent text-accent-fg"
+                          : "bg-elevated text-muted shadow-border hover:text-fg",
+                      )}
+                    >
+                      S
+                    </button>
+                  </div>
                   <Slider
                     min={0}
                     max={1}
@@ -321,7 +451,9 @@ export function DrumMachine() {
 
         <p className="px-1 text-center text-xs text-subtle sm:text-left">
           {armed
-            ? "Space plays. Drag across pads to paint. Tap a track to mute."
+            ? soloing
+              ? "Solo is on: only soloed tracks play. Mute always wins."
+              : "Space plays. Drag across pads to paint. M mutes, S solos, tap a track name to hear it."
             : "Press play to unlock audio, then tap pads or drag to paint a groove."}
         </p>
       </main>
