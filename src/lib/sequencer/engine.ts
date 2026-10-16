@@ -1,8 +1,8 @@
-import { bankForBar, clampChainPosition, nextChainPosition } from "./chain";
-import { effectiveGain } from "./mix";
-import { advanceClock, type ClockState, startClock } from "./timing";
-import type { MuteMap, Pattern, PatternBank, TrackId, VolumeMap } from "./types";
-import { STEP_COUNT, TRACK_IDS } from "./types";
+import { bankForBar, clampChainPosition, nextChainPosition } from "./chain.ts";
+import { effectiveGain } from "./mix.ts";
+import { advanceClock, type ClockState, startClock } from "./timing.ts";
+import type { MuteMap, Pattern, PatternBank, TrackId, VolumeMap } from "./types.ts";
+import { STEP_COUNT, TRACK_IDS } from "./types.ts";
 
 const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.12;

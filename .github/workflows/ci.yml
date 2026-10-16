@@ -24,5 +24,6 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
+        timeout-minutes: 1
       # build:dev only. `npm run build` also runs db:migrate, which must not run in CI.
       - run: npm run build:dev

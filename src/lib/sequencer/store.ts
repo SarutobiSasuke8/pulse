@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { clampChainPosition, MAX_CHAIN_LENGTH } from "./chain";
+import { clearBankIn, setStepIn, toggleStepIn } from "./pattern-edit";
 import { normalisePatternSet, type PatternSet } from "./pattern-set";
 import { clampBpm, clampSwing } from "./timing";
 import type { MuteMap, Pattern, PatternBank, TrackId, VolumeMap } from "./types";
@@ -138,16 +139,12 @@ export const useSequencer = create<SequencerState>()(
       selectBank: (bank) => set({ bank }),
       toggleStep: (track, step) => {
         const { banks, bank } = get();
-        const next = clonePattern(banks[bank]);
-        next[track][step] = !next[track][step];
-        set({ banks: { ...banks, [bank]: next } });
+        set({ banks: toggleStepIn(banks, bank, track, step) });
       },
       setStep: (track, step, on) => {
         const { banks, bank } = get();
-        if (banks[bank][track][step] === on) return;
-        const next = clonePattern(banks[bank]);
-        next[track][step] = on;
-        set({ banks: { ...banks, [bank]: next } });
+        const next = setStepIn(banks, bank, track, step, on);
+        if (next !== banks) set({ banks: next });
       },
       toggleMute: (track) => {
         const mutes = { ...get().mutes, [track]: !get().mutes[track] };
@@ -196,7 +193,7 @@ export const useSequencer = create<SequencerState>()(
       },
       clearPattern: () => {
         const { banks, bank } = get();
-        set({ banks: { ...banks, [bank]: emptyPattern() } });
+        set({ banks: clearBankIn(banks, bank) });
       },
       randomize: () => {
         const { banks, bank } = get();
